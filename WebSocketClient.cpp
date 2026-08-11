@@ -186,18 +186,14 @@ int WebSocketClient::timedRead() {
 	return client->read();
 }
 
+
 bool WebSocketClient::getMessage(String& message) {
-	if (!client->connected()) {	return false; }
+	if (!client->connected()) { return false; }
+	if (!client->available()) { return false; }
 
-	// 1. read type and fin
-	unsigned int msgtype = timedRead();
-	if (!client->connected()) {
-		DEBUG_WS("Step 1");
-		return false;
-	}
+	unsigned int msgtype = client->read();
 
-	// 2. read length and check if masked
-	int length = timedRead();
+	int length = client->read();
 	bool hasMask = false;
 	if (length & WS_MASK) {
 		hasMask = true;
@@ -205,30 +201,38 @@ bool WebSocketClient::getMessage(String& message) {
 	}
 
 	if (length == WS_SIZE16) {
-		length = timedRead() << 8;
-		length |= timedRead();
+		length = client->read() << 8;
+		length |= client->read();
 	}
 
-	// 3. read mask
+	uint8_t mask[4] = {0};
 	if (hasMask) {
-		uint8_t mask[4];
-		mask[0] = timedRead();
-		mask[1] = timedRead();
-		mask[2] = timedRead();
-		mask[3] = timedRead();
+		for (int i = 0; i < 4; i++) {
+			mask[i] = client->read();
+		}
+	}
 
-		// 4. read message (masked)
-		message = "";
+	unsigned long startTimeout = millis();
+	while (client->available() < length) {
+		if (millis() - startTimeout > 1000) { 
+			DEBUG_WS("[WS] Timeout waiting for payload");
+			return false;
+		}
+		delay(1);
+	}
+
+	message = "";
+	message.reserve(length); 
+
+	if (hasMask) {
 		for (int i = 0; i < length; ++i) {
-			message += (char) (timedRead() ^ mask[i % 4]);
+			message += (char) (client->read() ^ mask[i % 4]);
 		}
 	} else {
-		// 4. read message (unmasked)
-		message = "";
 		for (int i = 0; i < length; ++i) {
-			message += (char) timedRead();
+			message += (char) client->read();
 		}
 	}
-    
-    return true;
+
+	return true;
 }
