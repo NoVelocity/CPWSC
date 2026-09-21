@@ -23,11 +23,13 @@ public:
 	void setAuthorizationHeader(String header);
 
 private:
-	int timedRead();
+	void sendFrame(uint8_t opcode, const uint8_t *payload, size_t size);
 
-    void write(uint8_t data);
-    
-    void write(const char *str);
+	bool readExact(uint8_t *buf, size_t len, unsigned long timeoutMs);
+
+	void write(uint8_t data);
+
+	void write(const char *str);
 
 	String generateKey();
 
@@ -35,7 +37,7 @@ private:
 
 	String authorizationHeader = "";
 
-    bool websocketEstablished = false;
+	bool websocketEstablished = false;
 
 };
 
