@@ -4,11 +4,19 @@
 #include <WiFiClientSecure.h>
 
 #define WS_FIN            0x80
+#define WS_OPCODE_MASK    0x0F
 #define WS_OPCODE_TEXT    0x01
 #define WS_OPCODE_BINARY  0x02
+#define WS_OPCODE_CLOSE   0x08
+#define WS_OPCODE_PING    0x09
+#define WS_OPCODE_PONG    0x0A
 
 #define WS_MASK           0x80
 #define WS_SIZE16         126
+#define WS_SIZE64         127
+
+#define WS_MAX_PAYLOAD    8192   // frames larger than this drop the connection (RAM protection)
+#define WS_READ_TIMEOUT   2000   // ms to wait for the rest of a frame that already started
 
 #ifdef DEBUG
 #define DEBUG_WS Serial.println
@@ -141,97 +149,139 @@ void WebSocketClient::disconnect() {
     this->websocketEstablished = false;
 }
 
-void WebSocketClient::send(const String& str) {
-	DEBUG_WS("[WS] sending: " + str);
+// Client-to-server frames must be masked (RFC 6455 5.3). The whole frame is
+// assembled in one buffer and sent with a single write.
+void WebSocketClient::sendFrame(uint8_t opcode, const uint8_t *payload, size_t size) {
 	if (!client->connected()) {
 		DEBUG_WS("[WS] not connected...");
 		return;
 	}
+	if (size > 0xFFFF) {
+		DEBUG_WS("[WS] payload too large");
+		return;
+	}
 
-	// 1. send fin and type text
-	write(WS_FIN | WS_OPCODE_TEXT);
+	size_t headerLen = (size > 125) ? 8 : 6;   // 2 (+2 ext length) + 4 mask
+	uint8_t *buf = (uint8_t *) malloc(headerLen + size);
+	if (!buf) return;
 
-	// 2. send length
-	int size = str.length();
+	size_t p = 0;
+	buf[p++] = WS_FIN | opcode;
 	if (size > 125) {
-		write(WS_MASK | WS_SIZE16);
-		write((uint8_t) (size >> 8));
-		write((uint8_t) (size & 0xFF));
+		buf[p++] = WS_MASK | WS_SIZE16;
+		buf[p++] = (uint8_t) (size >> 8);
+		buf[p++] = (uint8_t) (size & 0xFF);
 	} else {
-		write(WS_MASK | (uint8_t) size);
+		buf[p++] = WS_MASK | (uint8_t) size;
 	}
 
-	// 3. send mask
 	uint8_t mask[4];
-	mask[0] = random(0, 256);
-	mask[1] = random(0, 256);
-	mask[2] = random(0, 256);
-	mask[3] = random(0, 256);
-
-	write(mask[0]);
-	write(mask[1]);
-	write(mask[2]);
-	write(mask[3]);
-
-	//4. send masked data
-	for (int i = 0; i < size; ++i) {
-		write(str[i] ^ mask[i % 4]);
+	for (int i = 0; i < 4; ++i) {
+		mask[i] = random(0, 256);
+		buf[p++] = mask[i];
 	}
+
+	for (size_t i = 0; i < size; ++i) {
+		buf[p + i] = payload[i] ^ mask[i % 4];
+	}
+
+	client->write(buf, p + size);
+	free(buf);
 }
 
-int WebSocketClient::timedRead() {
-	while (!client->available()) {
-		delay(20);
-	}
-	return client->read();
+void WebSocketClient::send(const String& str) {
+	DEBUG_WS("[WS] sending: " + str);
+	sendFrame(WS_OPCODE_TEXT, (const uint8_t *) str.c_str(), str.length());
 }
 
+bool WebSocketClient::readExact(uint8_t *buf, size_t len, unsigned long timeoutMs) {
+	unsigned long start = millis();
+	size_t got = 0;
+	while (got < len) {
+		int avail = client->available();
+		if (avail > 0) {
+			size_t want = len - got;
+			size_t n = ((size_t) avail < want) ? (size_t) avail : want;
+			int r = client->read(buf + got, n);
+			if (r > 0) got += r;
+		} else {
+			if (!client->connected() || millis() - start > timeoutMs) return false;
+			delay(1);
+		}
+	}
+	return true;
+}
 
 bool WebSocketClient::getMessage(String& message) {
 	if (!client->connected()) { return false; }
-	if (!client->available()) { return false; }
+	if (client->available() < 2) { return false; }
 
-	unsigned int msgtype = client->read();
+	// Once a frame has started we must consume all of it, otherwise the stream
+	// is desynchronized. Any failure from here on drops the connection.
+	uint8_t hdr[2];
+	if (!readExact(hdr, 2, WS_READ_TIMEOUT)) { disconnect(); return false; }
 
-	int length = client->read();
-	bool hasMask = false;
-	if (length & WS_MASK) {
-		hasMask = true;
-		length = length & ~WS_MASK;
-	}
+	uint8_t opcode = hdr[0] & WS_OPCODE_MASK;
+	bool hasMask = (hdr[1] & WS_MASK) != 0;
+	uint32_t length = hdr[1] & ~WS_MASK;
 
 	if (length == WS_SIZE16) {
-		length = client->read() << 8;
-		length |= client->read();
+		uint8_t ext[2];
+		if (!readExact(ext, 2, WS_READ_TIMEOUT)) { disconnect(); return false; }
+		length = ((uint32_t) ext[0] << 8) | ext[1];
+	} else if (length == WS_SIZE64) {
+		uint8_t ext[8];
+		if (!readExact(ext, 8, WS_READ_TIMEOUT)) { disconnect(); return false; }
+		if (ext[0] || ext[1] || ext[2] || ext[3]) { disconnect(); return false; }
+		length = ((uint32_t) ext[4] << 24) | ((uint32_t) ext[5] << 16) |
+				 ((uint32_t) ext[6] << 8) | ext[7];
+	}
+
+	if (length > WS_MAX_PAYLOAD) {
+		DEBUG_WS("[WS] frame too large, dropping connection");
+		disconnect();
+		return false;
 	}
 
 	uint8_t mask[4] = {0};
-	if (hasMask) {
-		for (int i = 0; i < 4; i++) {
-			mask[i] = client->read();
+	if (hasMask && !readExact(mask, 4, WS_READ_TIMEOUT)) { disconnect(); return false; }
+
+	// ---- control frames (ping / pong / close) ----
+	if (opcode & 0x08) {
+		if (length > 125) { disconnect(); return false; }   // invalid per RFC 6455
+
+		uint8_t payload[125];
+		if (!readExact(payload, length, WS_READ_TIMEOUT)) { disconnect(); return false; }
+		if (hasMask) {
+			for (uint32_t i = 0; i < length; ++i) payload[i] ^= mask[i % 4];
 		}
+
+		if (opcode == WS_OPCODE_PING) {
+			DEBUG_WS("[WS] ping -> pong");
+			sendFrame(WS_OPCODE_PONG, payload, length);   // echo payload back
+		} else if (opcode == WS_OPCODE_CLOSE) {
+			DEBUG_WS("[WS] close frame received");
+			sendFrame(WS_OPCODE_CLOSE, payload, length >= 2 ? 2 : 0);   // echo status code
+			disconnect();
+		}
+		// pong: nothing to do
+
+		return false;   // control frames are never reported as messages
 	}
 
-	unsigned long startTimeout = millis();
-	while (client->available() < length) {
-		if (millis() - startTimeout > 1000) { 
-			DEBUG_WS("[WS] Timeout waiting for payload");
-			return false;
-		}
-		delay(1);
-	}
-
+	// ---- data frames (text / binary) ----
 	message = "";
-	message.reserve(length); 
+	message.reserve(length);
 
-	if (hasMask) {
-		for (int i = 0; i < length; ++i) {
-			message += (char) (client->read() ^ mask[i % 4]);
+	uint8_t chunk[64];
+	uint32_t done = 0;
+	while (done < length) {
+		size_t n = (length - done < sizeof(chunk)) ? (length - done) : sizeof(chunk);
+		if (!readExact(chunk, n, WS_READ_TIMEOUT)) { disconnect(); return false; }
+		for (size_t i = 0; i < n; ++i) {
+			message += (char) (hasMask ? (chunk[i] ^ mask[(done + i) % 4]) : chunk[i]);
 		}
-	} else {
-		for (int i = 0; i < length; ++i) {
-			message += (char) client->read();
-		}
+		done += n;
 	}
 
 	return true;
